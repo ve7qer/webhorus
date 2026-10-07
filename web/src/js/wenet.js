@@ -125,6 +125,13 @@ function addFrameWenet(data) {
     }
 }
 
+function setImage(img, data) {
+    if (img.src.startsWith("blob:")) {
+        URL.revokeObjectURL(img.src)
+    }
+    img.src = URL.createObjectURL(new Blob([data], { type: "image/jpeg" }))
+}
+
 function addImage(data, callsign, id) {
     last_callsign = callsign;
     let card_div = document.getElementsByClassName("wenetimage")
@@ -143,7 +150,7 @@ function addImage(data, callsign, id) {
         cardBody.addEventListener("click", globalThis.toggleBigImage, false)
         card.appendChild(cardBody)
         const img = document.createElement("img")
-        img.src = "data:image/jpeg;base64," + btoa(data.reduce((data, byte) => data + String.fromCharCode(byte), ''));
+        setImage(img, data)
         cardBody.appendChild(img)
 
         let telem_card = document.getElementById("wenetgps")
@@ -154,7 +161,7 @@ function addImage(data, callsign, id) {
         }
 
     } else {
-        card_div[0].getElementsByClassName("card-body")[0].getElementsByTagName("img")[0].src = "data:image/jpeg;base64," + btoa(data.reduce((data, byte) => data + String.fromCharCode(byte), ''));
+        setImage(card_div[0].getElementsByClassName("card-body")[0].getElementsByTagName("img")[0], data)
     }
     document.title = "webwenet - " + callsign
 }
@@ -196,7 +203,7 @@ function getBaudRate(){
 }
 
 function start_wenet() {
-    globalThis.spectrum_layout.shapes = []
+    globalThis.waterfall.setShapes([])
 
 
     
@@ -227,8 +234,7 @@ function start_wenet() {
                
                 globalThis.set_worker_fft_rate()
 
-                globalThis.wfZ = []
-                globalThis.wfY = []
+                globalThis.waterfall.clear()
 
                 globalThis.worker.postMessage({
                     "config": {
@@ -278,36 +284,14 @@ function start_wenet() {
                 return
             }
             if (event.data.type == "fft") {
-                const fft = event.data.fft;
+                const fft = event.data.fft; // Float32Array, dB
                 const N = fft.length;
                 const sr = getSampleRate(); // 921416 or 960000
                 const binHz = sr / 2 / N;
+                const f0 = rtl.getFrequency()
 
-                //Setup arrays to a full buffer to avoid squish
-                if (globalThis.wfZ.length < globalThis.WF_MAX_ROWS) {
-                    const dummyData = Array(N).fill(globalThis.WF_ZMIN - 1)
-                    for (let i = 0; i < globalThis.WF_MAX_ROWS - 1; i++) {
-                        globalThis.wfZ.push(dummyData);
-                        globalThis.wfY.push(globalThis.wfRow++);
-                    }
-                }
-
-                globalThis.filtered_x_values = Array.from({length: N}, (_, i) =>
-                    (i * binHz + rtl.getFrequency()) / 1e6
-                );
-
-                const row = fft.map(v => (Number.isFinite(v) ? v : globalThis.WF_ZMIN - 1));
-                globalThis.wfZ.push(row);
-                globalThis.wfY.push(globalThis.wfRow++);
-
-                
-
-                if (globalThis.wfZ.length > globalThis.WF_MAX_ROWS) {
-                    globalThis.wfZ.shift();
-                    globalThis.wfY.shift();
-                }
-
-                globalThis.updateZScaleFromBuffer();
+                globalThis.waterfall.setFrequencies(f0 / 1e6, ((N - 1) * binHz + f0) / 1e6)
+                globalThis.waterfall.push(fft)
 
                 return;
             }
@@ -335,22 +319,7 @@ function start_wenet() {
                 return
             }
             if (event.data.type == "f_est") {
-                globalThis.spectrum_layout.annotations = event.data.args.map(
-                    (x) => {
-                        return {
-                            x: (x + rtl.getFrequency()) / 1e6,
-                            y: 1,
-                            yref: "paper",
-                            ay: 1.3,
-                            ayref: "paper",
-                            ax: 1,
-                            showarrow: true,
-                            arrowhead: 2,
-                            arrowsize: 1,       
-                            arrowcolor: "black"
-                        }
-                    }
-                )
+                globalThis.waterfall.setMarkers(event.data.args.map((x) => (x + rtl.getFrequency()) / 1e6))
                 return
             }
             console.error("Unhandled message")
@@ -373,7 +342,14 @@ function start_wenet() {
         }
         receiveSamples(I, Q, frequency) {
 
-            var max = Math.max(...(I.map(x => Math.abs(x))), ...(Q.map(x => Math.abs(x))))
+            const n = I.length
+            var max = 0
+            for (let x = 0; x < n; x++) {
+                const i = Math.abs(I[x])
+                const q = Math.abs(Q[x])
+                if (i > max) max = i
+                if (q > max) max = q
+            }
             var dBFS = 20 * Math.log10(max);
             globalThis.updatedbfs(dBFS)
 
@@ -388,10 +364,11 @@ function start_wenet() {
 
             if (latency < 2000) {
 
-                var buffer = []
-                for (var x = 0; x < I.length; x++) {
-                    buffer.push(I[x]);
-                    buffer.push(Q[x]);
+                // interleaved I/Q, transferred (not copied) to the worker
+                const buffer = new Float32Array(n * 2)
+                for (let x = 0; x < n; x++) {
+                    buffer[2 * x] = I[x];
+                    buffer[2 * x + 1] = Q[x];
                 }
 
                 last_sent = new Date()
@@ -422,7 +399,7 @@ function start_wenet() {
                         "time": last_sent,
                         "sh": sh,
                         "freq": rtl.getFrequency()
-                    })
+                    }, [buffer.buffer])
                 }
             }
 

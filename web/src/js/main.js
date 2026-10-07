@@ -16,6 +16,7 @@ import { ComplexDownsampler } from "@jtarrio/webrtlsdr/dsp/resamplers";
 import { concatenateReceivers } from "@jtarrio/webrtlsdr/radio/sample_receiver"
 
 import { start_wenet, stop_wenet } from "./wenet"
+import { Waterfall } from "./waterfall"
 import { pyodide } from './pyodide-wrapper';
 
 
@@ -27,10 +28,6 @@ const rtl_freq_est_lower = 1000;
 const rtl_freq_est_upper = 5000;
 
 globalThis.WF_MAX_ROWS = 50;
-globalThis.WF_ZMIN = -150;
-globalThis.wfZ = [];
-globalThis.wfY = [];
-globalThis.wfRow = 0;
 
 const fftSize = 16384
 
@@ -472,60 +469,7 @@ globalThis.Plotly.newPlot('snr', [{
     }
 }, { responsive: true, staticPlot: true });
 
-globalThis.spectrum_layout = {
-  autosize: true,
-  margin: { l: 40, r: 40, b: 40, t: 20, pad: 0 },
-  xaxis: {
-    title: 'Frequency [Hz]',
-    tickfont: { size: 12 }
-  },
-  yaxis: {
-    title: 'Time',
-    autorange: 'reversed',
-    tickfont: { size: 12 }
-  }
-};
-
-const turboColorscale = [
-  [0.0,   '#30123b'],
-  [0.1,   '#4145ab'],
-  [0.2,   '#4673e0'],
-  [0.3,   '#34a6dd'],
-  [0.4,   '#1ed5b6'],
-  [0.5,   '#32f17e'],
-  [0.6,   '#90f539'],
-  [0.7,   '#e4e61a'],
-  [0.8,   '#fcb414'],
-  [0.9,   '#f4630a'],
-  [1.0,   '#b21b0a']
-];
-
-const traceWaterfall = {
-  type: 'heatmap',
-  x: [], y: [], z: [],
-  colorscale: turboColorscale,
-  showscale: false,
-  xaxis: 'x2',
-  yaxis: 'y2',
-  zauto: false,
-  zsmooth: false
-};
-
-globalThis.spectrum_layout.xaxis = {
-  showticklabels: false,
-  showgrid: false,
-  zeroline: false,
-  title: ''
-};
-
-globalThis.spectrum_layout.yaxis = {
-  autorange: true,
-  showticklabels: false,
-  showgrid: false,
-  zeroline: false
-};
-
-globalThis.Plotly.newPlot('spectrum', [traceWaterfall], globalThis.spectrum_layout, { responsive: true, staticPlot: true });
+globalThis.waterfall = new Waterfall(document.getElementById('spectrum'), globalThis.WF_MAX_ROWS);
 
 globalThis.Plotly.newPlot('plots', [], {
     autosize: true,
@@ -549,57 +493,20 @@ globalThis.updateStats = function (stats) {
     const freq_mean = freq_est.reduce((a, b) => a + b, 0) / freq_est.length
 
     // update spectrum annotations
-    globalThis.spectrum_layout.annotations = freq_est.map((x) => {
+    globalThis.waterfall.setMarkers(freq_est.map((x) => {
         if (document.getElementById("radioRTL").checked) {
             x = rtl_offset + x
         }
-
-        return {
-            x: x,
-            y: 1,
-            yref: "paper",
-            ay: 1.3,
-            ax: 1,
-            ayref: "paper",
-            showarrow: true,
-            arrowhead: 2,
-            arrowsize: 1, 
-            arrowcolor: "black"
-        }
-
-    })
+        return x
+    }))
 
     if (document.getElementById("radioRTL").checked) {
-        globalThis.spectrum_layout.shapes = [
-            {
-                type: 'rect',
-                yref: 'paper',
-                x0: rtl_offset,
-                y0: 0,
-                x1: rtl_freq_est_lower + rtl_offset,
-                y1: 1,
-                fillcolor: '#d3d3d3',
-                opacity: 0.5,
-                line: {
-                    width: 0
-                }
-            },
-            {
-                type: 'rect',
-                yref: 'paper',
-                x0: rtl_freq_est_upper + rtl_offset,
-                y0: 0,
-                x1: rtl_offset * -1,
-                y1: 1,
-                fillcolor: '#d3d3d3',
-                opacity: 0.5,
-                line: {
-                    width: 0
-                }
-            }
-        ]
+        globalThis.waterfall.setShapes([
+            { x0: rtl_offset, x1: rtl_freq_est_lower + rtl_offset },
+            { x0: rtl_freq_est_upper + rtl_offset, x1: rtl_offset * -1 }
+        ])
     } else {
-        globalThis.spectrum_layout.shapes = []
+        globalThis.waterfall.setShapes([])
     }
 
     globalThis.Plotly.extendTraces('snr', {
@@ -1080,35 +987,13 @@ globalThis.startAudio = async function (constraint) {
                 clearInterval(globalThis.analyserUpdate)
             }
 
-            //Setup arrays to a full buffer to avoid squish
-            const dummyData = Array(globalThis.max_index).fill(globalThis.WF_ZMIN - 1)
-            globalThis.wfZ = []
-            globalThis.wfY = []
-            for (let i = 0; i < globalThis.WF_MAX_ROWS - 1; i++) {
-                globalThis.wfZ.push(dummyData);
-                globalThis.wfY.push(globalThis.wfRow++);
-            }
+            globalThis.waterfall.clear()
+            globalThis.waterfall.setFrequencies(globalThis.filtered_x_values[0], globalThis.filtered_x_values[globalThis.max_index - 1])
 
-           globalThis.analyserUpdate = setInterval(() => {
-                const buf = new Float32Array(globalThis.bufferLength);
+            const buf = new Float32Array(globalThis.bufferLength);
+            globalThis.analyserUpdate = setInterval(() => {
                 analyser.getFloatFrequencyData(buf);
-
-                const row = Array.from(buf.slice(0, globalThis.max_index), v =>
-                    Number.isFinite(v) ? v : (globalThis.WF_ZMIN - 1)
-                );
-
-
-                // 2) Puffer pflegen
-                globalThis.wfZ.push(row);
-                globalThis.wfY.push(globalThis.wfRow++);
-                if (globalThis.wfZ.length > globalThis.WF_MAX_ROWS) {
-                    globalThis.wfZ.shift();
-                    globalThis.wfY.shift();
-                }
-
-                globalThis.updateZScaleFromBuffer()
-
-
+                globalThis.waterfall.push(buf.subarray(0, globalThis.max_index))
             }, 500);
             log_entry(`FFT Started`, "light")
 
@@ -1165,7 +1050,10 @@ globalThis.startAudio = async function (constraint) {
         horusNode.port.onmessage = (e) => {
             on_audio(e.data)
 
-            var max_audio = Math.max(...e.data)
+            var max_audio = 0
+            for (const sample of e.data) {
+                if (sample > max_audio) max_audio = sample
+            }
             // update dbfs meter - and yes I know how silly it is that we are turning these back to floats....
             var dBFS = 20 * Math.log10(max_audio / 32767); // technically we are ignoring half the signal here, but lets assume its not too bias'd
             globalThis.updatedbfs(dBFS)
@@ -1197,33 +1085,13 @@ globalThis.startAudio = async function (constraint) {
                 clearInterval(globalThis.analyserUpdate)
             }
 
-            //Setup arrays to a full buffer to avoid squish
-            const dummyData = Array(globalThis.max_index).fill(globalThis.WF_ZMIN - 1)
-            globalThis.wfZ = []
-            globalThis.wfY = []
-            for (let i = 0; i < globalThis.WF_MAX_ROWS - 1; i++) {
-                globalThis.wfZ.push(dummyData);
-                globalThis.wfY.push(globalThis.wfRow++);
-            }
+            globalThis.waterfall.clear()
+            globalThis.waterfall.setFrequencies(globalThis.filtered_x_values[0], globalThis.filtered_x_values[globalThis.max_index - 1])
 
+            const buf = new Float32Array(globalThis.bufferLength);
             globalThis.analyserUpdate = setInterval(() => {
-                const buf = new Float32Array(globalThis.bufferLength);
                 analyser.getFloatFrequencyData(buf);
-
-                const row = Array.from(buf.slice(0, globalThis.max_index), v =>
-                    Number.isFinite(v) ? v : (globalThis.WF_ZMIN - 1)
-                );
-
-                globalThis.wfZ.push(row);
-                globalThis.wfY.push(globalThis.wfRow++);
-                if (globalThis.wfZ.length > globalThis.WF_MAX_ROWS) {
-                    globalThis.wfZ.shift();
-                    globalThis.wfY.shift();
-                }
-
-                globalThis.updateZScaleFromBuffer()
-
-
+                globalThis.waterfall.push(buf.subarray(0, globalThis.max_index))
             }, 500);
             log_entry(`FFT Started`, "light")
         }
@@ -1555,24 +1423,6 @@ globalThis.getWizardSoundDevices = function(){
         document.getElementById("wizard_sound_devices").appendChild(snd_li)
     })
 }
-
-globalThis.updateZScaleFromBuffer = function() {
-  const flat = globalThis.wfZ.flat();
-  const sorted = [...flat].filter(Number.isFinite).sort((a,b)=>a-b);
-  const p = q => sorted[Math.floor(q * (sorted.length - 1))];                  
-  const p95 = p(0.95);                    
-  const zmin = p95 - 15;
-  const zmax = p95 + 2;
-
-  globalThis.Plotly.restyle('spectrum', { 
-        zmin: [zmin], 
-        zmax: [zmax],
-        x: [globalThis.filtered_x_values],
-        y: [globalThis.wfY],
-        z: [globalThis.wfZ],
-    }, [0]);
-}
-
 
 globalThis.loadSettings();
 

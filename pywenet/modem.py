@@ -1,19 +1,13 @@
 from _drs232_ldpc_cffi import ffi as drs232_ffi
-from _drs232_ldpc_cffi.lib import MAX_ITER, CODELENGTH, NUMBERPARITYBITS, NUMBERROWSHCOLS, MAX_ROW_WEIGHT, MAX_COL_WEIGHT, H_rows, H_cols, sd_to_llr, run_ldpc_decoder, scramble_code
+from _drs232_ldpc_cffi.lib import MAX_ITER, CODELENGTH, NUMBERPARITYBITS, NUMBERROWSHCOLS, MAX_ROW_WEIGHT, MAX_COL_WEIGHT, H_rows, H_cols, DRS232_PACKET_LEN, drs232_framer_init, drs232_framer_process
 from _fsk_cffi import ffi
-from _fsk_cffi.lib import fsk_create, fsk_demod_sd, fsk_nin, fsk_get_demod_stats, fsk_demod, fsk_create_hbr, fsk_set_est_limits
-import enum
+from _fsk_cffi.lib import fsk_create, fsk_demod_sd, fsk_nin, fsk_get_demod_stats, fsk_demod, fsk_create_hbr, fsk_set_est_limits, fsk_demod_sd_batch
 import logging
-import binascii
-import collections
 
 
 BYTES_PER_PACKET = 256
 CRC_BYTES = 2
 PARITY_BYTES = 65
-
-# CRC16-CCITT from binascii
-crc16 = lambda x: binascii.crc_hqx(x,0xffff)
 
 class Modem():
     def __init__(self,
@@ -39,6 +33,9 @@ class Modem():
         )
         
         self.drs232_ldpc = DRS232_LDPC(rs232_framing=rs232_framing)
+        self.sdbuf = ffi.new("float[]", self.nbits)
+        self.batch_sdbuf = ffi.new("float[]", self.nbits)
+        self.consumed = ffi.new("int *")
 
     @property
     def nin(self):
@@ -59,133 +56,91 @@ class Modem():
             raise ValueError(
                 "Expected data isn't long enough for what the modem is requesting")
 
+        # samples can be bytes, bytearray or a memoryview, no copy is made
         modbuf = ffi.from_buffer("COMP[]", samples)
+        fsk_demod_sd(self.fsk, self.sdbuf, modbuf)
+        ffi.release(modbuf)
 
-        sdbuf = ffi.new("float[]", self.nbits)
+        return self.drs232_ldpc.write(self.sdbuf, self.nbits)
 
-        fsk_demod_sd(self.fsk, sdbuf, modbuf)
-        
+    def demodulate_batch(self, samples):
+        """Demodulate as many nin blocks as fit in samples (interleaved float32 I/Q).
 
+        Returns (packets, bytes_consumed). Unused samples should be passed in again
+        with the next call.
+        """
+        nsamples = len(samples) // 8
+        # nin varies by up to one symbol either side of N as timing is tracked
+        max_bits = (nsamples // max(self.fsk.N - self.fsk.Ts, 1) + 1) * self.nbits
+        if max_bits > len(self.batch_sdbuf):
+            self.batch_sdbuf = ffi.new("float[]", max_bits)
 
-        packets = self.drs232_ldpc.write(sdbuf)
-    
-        return packets
+        modbuf = ffi.from_buffer("COMP[]", samples)
+        nbits = fsk_demod_sd_batch(self.fsk, self.batch_sdbuf, len(self.batch_sdbuf), modbuf, nsamples, self.consumed)
+        ffi.release(modbuf)
 
+        packets = self.drs232_ldpc.write(self.batch_sdbuf, nbits) if nbits else []
+        return packets, self.consumed[0] * 8
 
-
-class DRS232_STATE(enum.Enum):
-    LOOK_FOR_UW = 0
-    COLLECT_PACKET = 1
 
 
 class DRS232_LDPC():
+    """UW search, de-framing, LDPC decode and CRC check, implemented in C (drs232_framer.c)"""
     def __init__(self, rs232_framing=True):
-        self.ldpc = drs232_ffi.new("struct LDPC *")
-        self.ldpc.max_iter = MAX_ITER
-        self.ldpc.dec_type = 0
-        self.ldpc.q_scale_factor = 1
-        self.ldpc.r_scale_factor = 1
-        self.ldpc.CodeLength = CODELENGTH
-        self.ldpc.NumberParityBits = NUMBERPARITYBITS
-        self.ldpc.NumberRowsHcols = NUMBERROWSHCOLS
-        self.ldpc.max_row_weight = MAX_ROW_WEIGHT
-        self.ldpc.max_col_weight = MAX_COL_WEIGHT
-        self.ldpc.H_rows = H_rows
-        self.ldpc.H_cols = H_cols
-        self.state = DRS232_STATE.LOOK_FOR_UW
-        self.bitbuffer = 0
+        ldpc = drs232_ffi.new("struct LDPC *")
+        ldpc.max_iter = MAX_ITER
+        ldpc.dec_type = 0
+        ldpc.q_scale_factor = 1
+        ldpc.r_scale_factor = 1
+        ldpc.CodeLength = CODELENGTH
+        ldpc.NumberParityBits = NUMBERPARITYBITS
+        ldpc.NumberRowsHcols = NUMBERROWSHCOLS
+        ldpc.max_row_weight = MAX_ROW_WEIGHT
+        ldpc.max_col_weight = MAX_COL_WEIGHT
+        ldpc.H_rows = H_rows
+        ldpc.H_cols = H_cols
         self.rs232_framing = rs232_framing
         if rs232_framing:
             self.bits_per_byte = 10
-            # UW pattern we look for, including start/stop bits 
-            self.uw = 0b0110101011010110011101111011110100000001
-            self.uw_allowed_errors = 5
-            self.uw_mask = pow(2,40)-1
             logging.debug("RS232 mode")
         else:
             self.bits_per_byte = 8
-            self.uw = 0b10101011110011011110111100000001 # note this is reversed
-            self.uw_allowed_errors = 4
-            self.uw_mask  = pow(2,32)-1
             logging.debug("Native mode")
         self.symbols_per_packet = (BYTES_PER_PACKET+CRC_BYTES+PARITY_BYTES)*self.bits_per_byte
 
-        
-        self.symbol_buf_no_rs232 = [0.0]*self.symbols_per_packet
-        self.symbol_buf= [0.0]*self.symbols_per_packet
-        self.llr = drs232_ffi.new("float[]", self.symbols_per_packet)
-        self.unpacked_packet = drs232_ffi.new("uint8_t[]", CODELENGTH)
-        self.parityCheckCount = drs232_ffi.new("int *")
-        self.packet = drs232_ffi.new("uint8_t[]", BYTES_PER_PACKET+CRC_BYTES)
-        self.count_packet = 0
-        self.count_packet_error = 0
+        self.framer = drs232_ffi.new("struct DRS232_FRAMER *")
+        drs232_framer_init(self.framer, ldpc, rs232_framing)
+        self.packets_out = None
+        self.max_packets = 0
 
-    """Processes a bit"""
-    def write(self, sdbuf):
+    @property
+    def count_packet(self):
+        return self.framer.count_packet
+
+    @property
+    def count_packet_error(self):
+        return self.framer.count_packet_error
+
+    """Processes a buffer of soft decisions"""
+    def write(self, sdbuf, n=None):
+        if n is None:
+            n = len(sdbuf)
+        max_packets = n // self.symbols_per_packet + 1
+        if max_packets > self.max_packets:
+            self.max_packets = max_packets
+            self.packets_out = drs232_ffi.new("uint8_t[]", max_packets * DRS232_PACKET_LEN)
+
+        count_before = self.framer.count_packet
+        npackets = drs232_framer_process(self.framer, sdbuf, n, self.packets_out, self.max_packets)
+
+        count = self.framer.count_packet
+        if count // 40 != count_before // 40:
+            logging.info(f"packets: {count} packet_errors:{self.framer.count_packet_error} PER: {self.framer.count_packet_error/count if count > 0 else "."} iter: {self.framer.last_iter}")
+
         packets = []
-        for symbol in sdbuf:
-
-            if self.state == DRS232_STATE.LOOK_FOR_UW:
-                bit = symbol < 0
-                self.bitbuffer = (self.bitbuffer << 1 | bit) & self.uw_mask
-
-                # check if we match uw
-                errors = (self.bitbuffer ^ self.uw).bit_count()
-
-                if errors <= self.uw_allowed_errors:
-                    self.ind = 0
-                    self.state = DRS232_STATE.COLLECT_PACKET
-                    
-                    #logging.debug("Next state COLLECT_PACKET")
-                continue
-                    
-            
-            if self.state == DRS232_STATE.COLLECT_PACKET:
-                if self.rs232_framing:
-                    self.symbol_buf[self.ind] = symbol
-                else:
-                    self.symbol_buf[self.ind] = symbol * scramble_code[self.ind%1000]
-                self.ind += 1
-
-                if self.ind == self.symbols_per_packet:
-                    # enough bits, remove rs232 sync symbols
-                    
-                    if self.rs232_framing:
-                        k=0
-                        for i in range(0,self.symbols_per_packet,self.bits_per_byte):
-                            for j in range(8):
-                                self.symbol_buf_no_rs232[k+j] = self.symbol_buf[i+7-j+1]
-                            k += 8
-                    else:
-                        self.symbol_buf_no_rs232 = self.symbol_buf
-                    
-
-                    sd_to_llr(self.llr, self.symbol_buf_no_rs232, CODELENGTH)
-                    _iter = run_ldpc_decoder(self.ldpc, self.unpacked_packet, self.llr, self.parityCheckCount)
-
-                    for i in range(BYTES_PER_PACKET+CRC_BYTES):
-                        abyte = 0
-                        for j in range(8):
-                            abyte |= self.unpacked_packet[8*i+j] << (7-j)
-                        self.packet[i] = abyte
-                    
-                    self.count_packet += 1
-                    
-                    _packet = bytes(ffi.buffer(self.packet))
-                    rx_checksum = crc16(_packet[:BYTES_PER_PACKET]).to_bytes(2,"little")
-                    tx_checksum = _packet[BYTES_PER_PACKET:BYTES_PER_PACKET+2]
-
-                    if self.count_packet % 40 == 0:
-                        logging.info(f"packets: {self.count_packet} packet_errors:{self.count_packet_error} PER: {self.count_packet_error/self.count_packet if self.count_packet > 0 else "."} iter: {_iter}")
-
-                    self.state = DRS232_STATE.LOOK_FOR_UW
-                    #logging.debug("Next state LOOK_FOR_UW")
-                    if (rx_checksum == tx_checksum):
-                        logging.debug("rx packet")
-                        packets.append(_packet)
-                    else:
-                        # logging.debug("checksum failed")
-                        # logging.debug(rx_checksum)
-                        # logging.debug(tx_checksum)
-                        self.count_packet_error += 1
+        if npackets:
+            raw = drs232_ffi.buffer(self.packets_out, npackets * DRS232_PACKET_LEN)
+            for i in range(npackets):
+                logging.debug("rx packet")
+                packets.append(bytes(raw[i*DRS232_PACKET_LEN:(i+1)*DRS232_PACKET_LEN]))
         return packets

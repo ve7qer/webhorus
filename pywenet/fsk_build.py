@@ -291,6 +291,14 @@ void fsk_demod(struct FSK *fsk, uint8_t rx_bits[],COMP fsk_in[]);
  */
 void fsk_demod_sd(struct FSK *fsk, float rx_bits[],COMP fsk_in[]);
 
+/*
+ * Run fsk_demod_sd over as many nin sized blocks as are available in fsk_in,
+ * so Python only has to make one call per buffer instead of one per block.
+ * Returns the number of soft decision bits written, *consumed is set to the
+ * number of samples used.
+ */
+int fsk_demod_sd_batch(struct FSK *fsk, float rx_bits[], int max_bits, COMP fsk_in[], int nsamples, int *consumed);
+
 /* enables/disables normalisation of eye diagram samples */
   
 void fsk_stats_normalise_eye(struct FSK *fsk, int normalise_enable);
@@ -385,6 +393,19 @@ ffibuilder.set_source("_fsk_cffi",
 """
      #include "modem_stats.h"
      #include "fsk.h"   // the C header of the library
+
+     int fsk_demod_sd_batch(struct FSK *fsk, float rx_bits[], int max_bits, COMP fsk_in[], int nsamples, int *consumed) {
+         int used = 0;
+         int nbits = 0;
+         while (nsamples - used >= fsk_nin(fsk) && nbits + fsk->Nbits <= max_bits) {
+             int nin = fsk_nin(fsk);
+             fsk_demod_sd(fsk, &rx_bits[nbits], &fsk_in[used]);
+             used += nin;
+             nbits += fsk->Nbits;
+         }
+         *consumed = used;
+         return nbits;
+     }
 """,
       sources=[
         "./wenet/src/fsk.c",

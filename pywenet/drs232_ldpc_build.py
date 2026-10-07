@@ -41,6 +41,18 @@ void symbols_to_llrs(float llr[], COMP rx_qpsk_symbols[], float rx_amps[], float
 
 void ldpc_print_info(struct LDPC *ldpc);
 
+#define DRS232_PACKET_LEN 258
+
+struct DRS232_FRAMER {
+    int count_packet;
+    int count_packet_error;
+    int last_iter;
+    ...;
+};
+
+void drs232_framer_init(struct DRS232_FRAMER *f, struct LDPC *ldpc, int rs232_framing);
+int drs232_framer_process(struct DRS232_FRAMER *f, float sd[], int n, uint8_t packets_out[], int max_packets);
+
 
 #define MODEM_STATS_NC_MAX      20
 #define MODEM_STATS_NR_MAX      8
@@ -263,12 +275,14 @@ ffibuilder.set_source("_drs232_ldpc_cffi",
      #include "phi0.h"
      #include "H2064_516_sparse.h"
      #include "wenet_scramble.h"
+     #include "drs232_framer.h"
 """,
       sources=[
         "./wenet/src/mpdecode_core.c",
         "./wenet/src/phi0.c",
+        "./pywenet/drs232_framer.c",
       ],
-       include_dirs = [ "./wenet/src"],
+       include_dirs = [ "./wenet/src", "./pywenet"],
        extra_compile_args = ["-sSTACK_SIZE=5MB"] if os.environ.get("PYODIDE_EMSCRIPTEN_VERSION") else [] # hack to only set this on web builds
      )   # library name, for the linker
 

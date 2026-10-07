@@ -3,6 +3,7 @@ import { pyodide } from './pyodide-wrapper';
 let buffer = []
 var wenet
 var write_wenet
+var fft_est
 let payload_callsign
 
 let modem_states = null;
@@ -53,29 +54,30 @@ self.onmessage = async (event) => {
                 rs232_framing=self.rs232_framing,
                 partialupdate=25,
                 )
-            buffer = b''
+            from _fsk_cffi import ffi as fsk_ffi
+            buffer = bytearray()
             def write_wenet(audio):
+                # audio is a Float32Array of interleaved I/Q samples
                 global buffer
-                if audio:
-                    audio = audio.to_py(depth=1)
-                    audio = struct.pack(('f'*len(audio)), *audio)  
-                    buffer = buffer + audio
-                    outputs = []
-                    while len(buffer) >= wenet.nin * 2 * 4:
-                        in_modem = buffer[:wenet.nin *2 * 4]
-                        buffer = buffer[wenet.nin *2 * 4:]
-                        
-                        wenet_return = wenet.write(in_modem)
-                        if wenet_return:
-                            outputs.append(wenet_return)
-                    return outputs
-                return []    
+                if audio is None:
+                    return []
+                buffer += audio.to_memoryview()
+                with memoryview(buffer) as mv:
+                    consumed, outputs = wenet.write_samples(mv)
+                del buffer[:consumed]
+                return outputs
+
+            def fft_est():
+                # raw float32 magnitudes from the modem's frequency estimator
+                fsk = wenet.wenet.fsk
+                return fsk_ffi.buffer(fsk.fft_est, (fsk.Ndft // 2) * 4)[:]
               
         `
         )
 
         wenet = pyodide.runPython(`wenet`);
         write_wenet = pyodide.runPython(`write_wenet`);
+        fft_est = pyodide.runPython(`fft_est`);
         console.log("Python ran.")
         return
     }
@@ -84,9 +86,11 @@ self.onmessage = async (event) => {
     }
     sh_config = event.data.sh // update sondehub config from main thread
     freq = event.data.freq
-    const wenet_returns = write_wenet(event.data.buffer)
+    const wenet_returns_proxy = write_wenet(event.data.buffer)
+    const wenet_returns = wenet_returns_proxy.toJs({ dict_converter: Object.fromEntries })
+    wenet_returns_proxy.destroy()
 
-    for (const element of wenet_returns.toJs({ dict_converter: Object.fromEntries })) {
+    for (const element of wenet_returns) {
         self.postMessage({ "type": element[0], "args": element[1] })
 
         // upload ssdv images
@@ -214,12 +218,20 @@ function startFFTLoop(interval) {
   fftInterval = interval;
 
   modem_states = setInterval(() => {
-    var fft = pyodide.runPython("list(wenet.wenet.fsk.fft_est[0:wenet.wenet.fsk.Ndft//2])").toJs()
-    fft = fft.map((x) => Math.log10(x) * 10)
+    if (fft_est == undefined) {
+        return
+    }
+    const fft_proxy = fft_est()
+    // slice() gives us our own aligned ArrayBuffer that is safe to transfer
+    const fft = new Float32Array(fft_proxy.toJs().slice().buffer)
+    fft_proxy.destroy()
+    for (let i = 0; i < fft.length; i++) {
+        fft[i] = Math.log10(fft[i]) * 10
+    }
     snr = wenet.wenet.stats.snr_est
     f_est = [wenet.wenet.stats.f_est.get(0), wenet.wenet.stats.f_est.get(1)]
     self.postMessage({ "type": "snr", "args": snr })
-    self.postMessage({ "type": "fft", "fft": fft })
+    self.postMessage({ "type": "fft", "fft": fft }, [fft.buffer])
     self.postMessage({ "type": "f_est", "args": f_est })
   }, fftInterval);
 }

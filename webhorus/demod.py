@@ -18,25 +18,12 @@ horus_api = _horus_api_cffi.lib
 SNR_SAMPLES = 10
 
 
-def stuct_to_dict(data):
-    try:
-        if data.__module__ == '_cffi_backend':
-            data = list(data)
-            data = [ 
-                x
-                if type(x).__module__ != '_cffi_backend'
-                else stuct_to_dict(x) 
-                for x in data
-            ]
-            return data
-    except:
-        pass
-    return {
-        x: data.__getattribute__(x)
-        if type(data.__getattribute__(x)).__module__ != '_cffi_backend'
-        else stuct_to_dict(data.__getattribute__(x)) 
-        for x in dir(data)
-    }
+# scalar MODEM_STATS fields returned by Demod.modem_stats. The large arrays
+# (rx_symbols, rx_eye, fft_buf) are skipped as nothing in webhorus uses them and
+# converting them cost more than the demodulation itself.
+MODEM_STATS_FIELDS = ("Nc", "snr_est", "nr", "sync", "foff", "rx_timing", "clock_offset",
+                      "sync_metric", "neyetr", "neyesamp")
+
 
 @dataclass
 class Frame():
@@ -79,6 +66,10 @@ class Demod():
         # set verbose
         horus_api.horus_set_verbose(self.hstates, verbose)
 
+        self._stats = _horus_api_cffi.ffi.new("struct MODEM_STATS *")
+        # stats from the most recent demodulate() call
+        self.last_stats = None
+
     @property
     def sample_rate(self):
         return horus_api.horus_get_Fs(self.hstates)
@@ -104,9 +95,11 @@ class Demod():
     
     @property
     def modem_stats(self):
-        stats = _horus_api_cffi.ffi.new("struct MODEM_STATS *")
+        stats = self._stats
         horus_api.horus_get_modem_extended_stats(self.hstates, stats)
-        return stuct_to_dict(stats)
+        result = {x: getattr(stats, x) for x in MODEM_STATS_FIELDS}
+        result["f_est"] = list(stats.f_est)
+        return result
     
     @property
     def mode(self):
@@ -135,11 +128,8 @@ class Demod():
         horus_api.horus_close(self.hstates)
 
     def demodulate(self, audio_in):
-        audio_id_data = _horus_api_cffi.ffi.new("char[]",audio_in)
-        data_in = _horus_api_cffi.ffi.cast( # cast bytes to short
-            "short *",
-            audio_id_data
-        )
+        # audio_in is int16 samples as bytes, bytearray or memoryview, no copy is made
+        data_in = _horus_api_cffi.ffi.from_buffer("short[]", audio_in)
         data_out = _horus_api_cffi.ffi.new("char[]", self.max_ascii_out)
         valid = horus_api.horus_rx(
             self.hstates,
@@ -162,13 +152,14 @@ class Demod():
                 pass
 
 
-        self.snr_samples.append(self.modem_stats['snr_est'])
+        self.last_stats = self.modem_stats
+        self.snr_samples.append(self.last_stats['snr_est'])
         self.snr_samples = self.snr_samples[-SNR_SAMPLES:]
         if valid:
             return Frame(
                 data=data_out_bytes,
                 crc_pass=crc,
-                stats=self.modem_stats
+                stats=self.last_stats
             )
 
 
