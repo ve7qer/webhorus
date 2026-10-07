@@ -49,7 +49,7 @@ echo "    Updating stack files..."
 sudo mkdir -p "$STACK/tailscale-config"
 sudo cp /tmp/webhorus-compose.yml "$STACK/compose.yaml"
 sudo cp /tmp/webhorus-serve.json "$STACK/tailscale-config/serve.json"
-sudo touch "$STACK/.env" # TS_AUTHKEY=... may be added here; optional
+sudo touch "$STACK/.env" # holds TS_AUTHKEY=tskey-auth-..., needed for the first login
 
 echo "    Starting containers..."
 cd "$STACK"
@@ -63,5 +63,5 @@ REMOTE
 
 echo ""
 echo "==> Deployed $VERSION"
-echo "    If this is the first deploy, authorise the node with the URL from:"
-echo "      ssh $NAS_HOST sudo docker logs webhorus-tailscale 2>&1 | grep login.tailscale.com"
+echo "    First deploy? Put TS_AUTHKEY=tskey-auth-... in $NAS_STACK_DIR/.env and run"
+echo "      ssh $NAS_HOST 'cd $NAS_STACK_DIR && sudo docker compose up -d --force-recreate tailscale'"

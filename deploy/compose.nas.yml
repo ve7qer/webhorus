@@ -14,8 +14,9 @@ services:
     hostname: webhorus
     restart: unless-stopped
     environment:
-      # Optional, from the stack .env file. If empty, the container logs a
-      # login.tailscale.com URL to authorise the node once; state is persisted.
+      # From the stack .env file. Only needed for the first login, after which
+      # the node state is kept in the tailscale_state volume. (Without a key the
+      # container's login URL is only valid for ~60 s before it restarts.)
       - TS_AUTHKEY=${TS_AUTHKEY:-}
       - TS_SERVE_CONFIG=/config/serve.json
       - TS_STATE_DIR=/var/lib/tailscale
